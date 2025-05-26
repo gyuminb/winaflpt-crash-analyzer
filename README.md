@@ -243,6 +243,11 @@ We have extended the **Intel PT** mode with a companion tool,
 
 This unified pipeline means **one command** is all you need after fuzzing to shrink hundreds of crashes into a handful of actionable cases—complete with register context, full PT trace, memory dumps, and a precise entry point.
 
+**Usage**  
+```txt
+winaflpt-crash-analyzer.exe <fuzz_output_folder> [-coverage_module module.dll]
+```
+
 ## Attaching to a running process
 
 The DynamoRIO instrumentation mode supports dynamically attaching to running processes. This option can be used to fuzz processes that cannot be directly launched by WinAFL, such as system services.
