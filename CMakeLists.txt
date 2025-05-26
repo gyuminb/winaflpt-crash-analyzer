@@ -120,6 +120,26 @@ if (${INTELPT})
   target_link_libraries(winaflpt-debug "psapi.lib")
   target_link_libraries(winaflpt-debug "Dbghelp.lib")
 
+  project(winafl-crash-analyzer)
+  ADD_EXECUTABLE(winaflpt-crash-analyzer
+      winaflpt-crash-analyzer.cpp
+      analyze_trace.cpp
+      third_party/processor-trace/libipt/src/pt_cpu.c
+      third_party/processor-trace/libipt/src/windows/pt_cpuid.c
+    )
+  
+  target_compile_features(winaflpt-crash-analyzer PUBLIC cxx_std_17)
+  set_target_properties(winaflpt-crash-analyzer PROPERTIES
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+  )
+  
+  target_link_libraries(winaflpt-crash-analyzer winipt)
+  target_link_libraries(winaflpt-crash-analyzer libipt)
+  target_link_libraries(winaflpt-crash-analyzer"psapi.lib")
+  target_link_libraries(winaflpt-crash-analyzer "Dbghelp.lib")
+  target_link_libraries(winaflpt-crash-analyzer "dbgeng.lib")
+
 endif()
 
 if (${TINYINST})

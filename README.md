@@ -231,6 +231,18 @@ Before using WinAFL for the first time, you should read the documentation for
 the specific instrumentation mode you are interested in. These also contain
 usage examples.
 
+## Crash Deduplication & Root Cause Analysis Support
+
+We have extended the **Intel PT** mode with a companion tool,
+`winaflpt-crash-analyzer`, providing a single-step pipeline from fuzz output to actionable crash root-cause information:
+
+1. **Call-stack deduplication** – 1st-stage crash filtering by comparing saved call stacks.
+2. **Instruction-level flow reconstruction** – Decode PT logs + memory dumps via libipt and DbgEng.  
+3. **Root Cause Seed Exraction** – Starting from the crash instruction in the reconstructed flow, trace backward along data and control dependencies to extract the minimal `Root Cause Seed` instruction set that led to the crash.    
+4. **Seed-based deduplication** – Final unique-crash selection by comparing minimal root-cause instruction sets.  
+
+This unified pipeline means **one command** is all you need after fuzzing to shrink hundreds of crashes into a handful of actionable cases—complete with register context, full PT trace, memory dumps, and a precise entry point.
+
 ## Attaching to a running process
 
 The DynamoRIO instrumentation mode supports dynamically attaching to running processes. This option can be used to fuzz processes that cannot be directly launched by WinAFL, such as system services.

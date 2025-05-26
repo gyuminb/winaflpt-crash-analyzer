@@ -16,6 +16,8 @@ u8 sinkhole_stds = 0;
 u64 mem_limit = 0;
 u64 cpu_aff = 0;
 
+DWORD ret_exception_code = 0;
+
 // todo the below functions are copied from afl-fuzz.c
 // they should be taken out to a separate file to avoid duplication
 

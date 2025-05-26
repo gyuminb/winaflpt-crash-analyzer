@@ -5,9 +5,12 @@
    Original AFL code written by Michal Zalewski <lcamtuf@google.com>
 
    Windows fork written and maintained by Ivan Fratric <ifratric@google.com>
+   
+   Modified by Gyumin Baek <guminb@ajou.ac.kr> (2025)
 
    Copyright 2016 Google Inc. All Rights Reserved.
-
+   Copyright 2025 Gyumin Baek. All Rights Reserved.
+   
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at
@@ -3791,6 +3794,21 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   ck_free(fn);
 
+  if(use_intelpt && fault == FAULT_CRASH){
+    fn = alloc_printf("%s\\crashes\\id_%06llu_%02u_%s_debug.txt", out_dir, unique_crashes - 1, kill_signal, exception_name);
+    save_crash_info(fn);
+    ck_free(fn);
+
+    fn = alloc_printf("%s\\crashes\\id_%06llu_%02u_%s_ptlog.pt", out_dir, unique_crashes - 1, kill_signal, exception_name);
+    save_crash_ptlog(fn);
+    ck_free(fn);
+
+    fn = alloc_printf("%s\\crashes\\id_%06llu_%02u_%s_process.dmp", out_dir, unique_crashes - 1, kill_signal, exception_name);
+    save_crash_dump(fn);
+    ck_free(fn);
+    
+  }
+  
   return keeping;
 
 }

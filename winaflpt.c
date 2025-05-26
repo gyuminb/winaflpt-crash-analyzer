@@ -3,8 +3,11 @@
   ------------------------------------------------
 
   Written and maintained by Ivan Fratric <ifratric@google.com>
+  Modified by Gyumin Baek <guminb@ajou.ac.kr> (2025)
 
   Copyright 2016 Google Inc. All Rights Reserved.
+  Copyright 2025 Gyumin Baek. All Rights Reserved.
+  
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
   You may obtain a copy of the License at
@@ -39,6 +42,8 @@
 #include "winaflpt.h"
 
 #include "ptdecode.h"
+#include <fcntl.h>
+#define TEMP_DUMP_FILENAME "temp_full.dmp"
 
 // tests the custom decoders gainst the corresponding
 // reference implementatopns from Intel
@@ -100,6 +105,8 @@ extern u64 mem_limit;
 extern u64 cpu_aff;
 
 extern char *fuzzer_id;
+
+extern DWORD ret_exception_code;
 
 static FILE *debug_log = NULL;
 
@@ -167,6 +174,18 @@ struct winafl_breakpoint {
 	struct winafl_breakpoint *next;
 };
 struct winafl_breakpoint *breakpoints;
+
+typedef struct _crash_debug_info {
+    DWORD ret_exception_code;
+	DWORD crash_thread_id;
+    char call_stack[65536];
+    char registers[4096];
+} crash_debug_info_t;
+
+
+static crash_debug_info_t tmp_crash_info;
+static PIPT_TRACE_DATA tmp_raw_pt_data = NULL;
+static size_t tmp_raw_pt_data_size = 0;
 
 static void
 winaflpt_options_init(int argc, const char *argv[])
@@ -734,7 +753,7 @@ void add_module_to_section_cache(HMODULE module, char *module_name) {
 
 	// todo put these files in a separate directory and clean it periodically
 	char tmpfilename[MAX_PATH];
-	sprintf(tmpfilename, "%s\\sectioncache_%p.dat", section_cache_dir, module_info.lpBaseOfDll);
+	sprintf(tmpfilename, "%s\\sectioncache_%s_%016llx_%08x.dat", section_cache_dir, module_name, (unsigned long long)module_info.lpBaseOfDll, module_info.SizeOfImage);
 
 	BYTE *modulebuf = (BYTE *)malloc(module_info.SizeOfImage);
 	size_t num_read;
@@ -1069,6 +1088,312 @@ int handle_breakpoint(void *address, DWORD thread_id) {
 	return ret;
 }
 
+void save_crash_info(const char *fn)
+{
+    int fd = open(fn, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
+    if (fd < 0) {
+        PFATAL("Unable to create '%s'", fn);
+    }
+
+    const char *delimiter = "\n-------------------------------------------\n";
+    char buf[512] = {0};
+    int len = 0;
+
+    len = snprintf(buf, sizeof(buf), "Exception Code: 0x%08X\n", tmp_crash_info.ret_exception_code);
+    ck_write(fd, buf, len, fn);
+	len = snprintf(buf, sizeof(buf), "Crash Thread ID: 0x%08X", tmp_crash_info.crash_thread_id);
+    ck_write(fd, buf, len, fn);
+    ck_write(fd, delimiter, strlen(delimiter), fn);
+
+    ck_write(fd, tmp_crash_info.registers, strlen(tmp_crash_info.registers), fn);
+    ck_write(fd, delimiter, strlen(delimiter), fn);
+    ck_write(fd, tmp_crash_info.call_stack, strlen(tmp_crash_info.call_stack), fn);
+
+    close(fd);
+}
+
+static void load_all_modules(HANDLE process) {
+    HMODULE *module_handles = NULL;
+    DWORD num_modules = get_all_modules(&module_handles);
+    for (DWORD i = 0; i < num_modules; i++) {
+        MODULEINFO mi;
+        if (GetModuleInformation(process, module_handles[i], &mi, sizeof(mi))) {
+            DWORD64 base_addr = (DWORD64)mi.lpBaseOfDll;
+            DWORD size = mi.SizeOfImage;
+            char moduleName[MAX_PATH] = {0};
+            GetModuleBaseNameA(process, module_handles[i], moduleName, sizeof(moduleName));
+
+#ifdef _WIN64
+            SymLoadModule64(process, NULL, moduleName, NULL, base_addr, size);
+#else
+			SymLoadModule(process, NULL, moduleName, NULL, base_addr, size);
+#endif
+		}
+    }
+    if (module_handles)
+        free(module_handles);
+}
+
+void capture_crash_debug_info(LPDEBUG_EVENT DebugEv)
+{
+    memset(&tmp_crash_info, 0, sizeof(tmp_crash_info));
+	int pos = 0;
+	HANDLE process = child_handle;
+    HANDLE thread_handle = OpenThread(THREAD_ALL_ACCESS, FALSE, DebugEv->dwThreadId);
+    if (!thread_handle) {
+        FATAL("OpenThread failed, GLE=%x.\n", GetLastError());
+    }
+
+    tmp_crash_info.ret_exception_code = DebugEv->u.Exception.ExceptionRecord.ExceptionCode;
+	tmp_crash_info.crash_thread_id = DebugEv->dwThreadId;
+
+	if (!SymInitialize(process, NULL, TRUE)) {
+        FATAL("SymInitialize failed, GLE=%x.\n", GetLastError());
+    }
+	
+	// DWORD options = SymGetOptions();
+    // options |= SYMOPT_LOAD_LINES | SYMOPT_UNDNAME;
+    // SymSetOptions(options);
+	load_all_modules(process);
+
+    BOOL wow64remote = FALSE;
+    if (!IsWow64Process(process, &wow64remote)) {
+        FATAL("IsWow64Process failed");
+    }
+	
+#ifdef _WIN64
+    if (wow64remote) {
+        WOW64_CONTEXT ctx32 ={0};
+        ctx32.ContextFlags = CONTEXT_FULL;
+        
+		if (!Wow64GetThreadContext(thread_handle, &ctx32)) {
+            CloseHandle(thread_handle);
+            FATAL("Wow64GetThreadContext failed, GLE=%x.\n", GetLastError());
+        }
+
+		pos += sprintf(tmp_crash_info.registers + pos, "EIP=0x%08x ESP=0x%08x EBP=0x%08x\n", ctx32.Eip, ctx32.Esp, ctx32.Ebp);
+		pos += sprintf(tmp_crash_info.registers + pos, "EAX=0x%08x EBX=0x%08x ECX=0x%08x\n", ctx32.Eax, ctx32.Ebx, ctx32.Ecx);
+		pos += sprintf(tmp_crash_info.registers + pos, "EDX=0x%08x ESI=0x%08x EDI=0x%08x\n", ctx32.Edx, ctx32.Esi, ctx32.Edi);
+        
+        // 콜스택 수집 (32비트용)
+        STACKFRAME64 stackFrame = {0};
+        DWORD machineType = IMAGE_FILE_MACHINE_I386;
+        stackFrame.AddrPC.Offset   = ctx32.Eip;
+        stackFrame.AddrPC.Mode     = AddrModeFlat;
+        stackFrame.AddrFrame.Offset = ctx32.Ebp;
+        stackFrame.AddrFrame.Mode   = AddrModeFlat;
+        stackFrame.AddrStack.Offset = ctx32.Esp;
+        stackFrame.AddrStack.Mode   = AddrModeFlat;
+        
+        char stackBuffer[65536] = {0};
+        int frameCount = 0;
+
+        while (StackWalk64(machineType, process, thread_handle, &stackFrame, (PVOID)&ctx32, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL) && frameCount < 64) {
+            char temp[512] = {0};
+            DWORD64 addr = stackFrame.AddrPC.Offset;
+            SYMBOL_INFO *symbol = (SYMBOL_INFO *)malloc(sizeof(SYMBOL_INFO) + 256 * sizeof(char));
+
+            if (symbol) {
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                
+				if (SymFromAddr(process, addr, 0, symbol)) {
+                    IMAGEHLP_MODULE64 modInfo;
+                    modInfo.SizeOfStruct = sizeof(modInfo);
+
+                    if (SymGetModuleInfo64(process, addr, &modInfo)) {
+                        DWORD64 offset = addr - symbol->Address;
+                        // format: [#] ModuleName!SymbolName+0xOffset - 0xAddress
+                        snprintf(temp, sizeof(temp), "[#]%d %s!%s+0x%lx - 0x%08llx\n", frameCount, modInfo.ModuleName, symbol->Name, (unsigned long)offset, addr);
+                    } else {
+                        DWORD64 offset = addr - symbol->Address;
+                        snprintf(temp, sizeof(temp), "[#]%d %s+0x%lx - 0x%08llx\n", frameCount, symbol->Name, (unsigned long)offset, addr);
+                    }
+                } else {
+                    snprintf(temp, sizeof(temp), "[#]%d 0x%08llx\n", frameCount, addr);
+                }
+
+                free(symbol);
+                strncat(stackBuffer, temp, sizeof(stackBuffer) - strlen(stackBuffer) - 1);
+                frameCount++;
+            } 
+			else {
+                FATAL("malloc failed, GLE=%x.\n", GetLastError());
+            }
+        }
+
+        strncpy(tmp_crash_info.call_stack, stackBuffer, sizeof(tmp_crash_info.call_stack) - 1);
+        tmp_crash_info.call_stack[sizeof(tmp_crash_info.call_stack) - 1] = '\0';
+    }
+	else {
+
+        CONTEXT ctx64 = {0};
+        ctx64.ContextFlags = CONTEXT_FULL;
+        
+		if (!GetThreadContext(thread_handle, &ctx64)) {
+            CloseHandle(thread_handle);
+            FATAL("GetThreadContext failed, GLE=%x.\n", GetLastError());
+        }
+
+        pos += sprintf(tmp_crash_info.registers + pos, "RIP=0x%016llx RSP=0x%016llx RBP=0x%016llx RAX=0x%016llx\n", ctx64.Rip, ctx64.Rsp, ctx64.Rbp, ctx64.Rax);
+		pos += sprintf(tmp_crash_info.registers + pos, "RCX=0x%016llx RDX=0x%016llx RBX=0x%016llx RSI=0x%016llx\n", ctx64.Rcx, ctx64.Rdx, ctx64.Rbx, ctx64.Rsi);
+		pos += sprintf(tmp_crash_info.registers + pos, "RDI=0x%016llx R8=0x%016llx R9=0x%016llx R10=0x%016llx\n", ctx64.Rdi, ctx64.R8, ctx64.R9, ctx64.R10);
+		pos += sprintf(tmp_crash_info.registers + pos, "R11=0x%016llx R12=0x%016llx R13=0x%016llx  R14=0x%016llx R15=0x%016llx\n", ctx64.R11, ctx64.R12, ctx64.R13, ctx64.R14, ctx64.R15); 
+        
+		
+        STACKFRAME64 stackFrame = {0};
+		DWORD machineType = IMAGE_FILE_MACHINE_AMD64;
+        stackFrame.AddrPC.Offset   = ctx64.Rip;
+        stackFrame.AddrPC.Mode     = AddrModeFlat;
+        stackFrame.AddrFrame.Offset = ctx64.Rbp;
+        stackFrame.AddrFrame.Mode   = AddrModeFlat;
+        stackFrame.AddrStack.Offset = ctx64.Rsp;
+        stackFrame.AddrStack.Mode   = AddrModeFlat;
+
+        char stackBuffer[65536] = {0};
+        int frameCount = 0;
+        while (StackWalk64(machineType, process, thread_handle, &stackFrame, &ctx64, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL) && frameCount < 64) {
+            char temp[512] = {0};
+            DWORD64 addr = stackFrame.AddrPC.Offset;
+            SYMBOL_INFO *symbol = (SYMBOL_INFO *)malloc(sizeof(SYMBOL_INFO) + 256 * sizeof(char));
+            
+			if (symbol) {
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                
+				if (SymFromAddr(process, addr, 0, symbol)) {
+                    IMAGEHLP_MODULE64 modInfo;
+                    modInfo.SizeOfStruct = sizeof(modInfo);
+                    
+					if (SymGetModuleInfo64(process, addr, &modInfo)) {
+                        DWORD64 offset = addr - symbol->Address;
+                        snprintf(temp, sizeof(temp), "[#]%d %s!%s+0x%lx - 0x%016llx\n", frameCount, modInfo.ModuleName, symbol->Name, (unsigned long)offset, addr);
+                    } 
+					else {
+                        DWORD64 offset = addr - symbol->Address;
+                        snprintf(temp, sizeof(temp), "[#]%d %s+0x%lx - 0x%016llx\n", frameCount, symbol->Name, (unsigned long)offset, addr);
+                    }
+                } 
+				else {
+                    snprintf(temp, sizeof(temp), "[#]%d 0x%016llx\n", frameCount, addr);
+                }
+                
+				free(symbol);
+                strncat(stackBuffer, temp, sizeof(stackBuffer) - strlen(stackBuffer) - 1);
+                frameCount++;
+            } 
+			else {
+                FATAL("malloc failed, GLE=%x.\n", GetLastError());
+            }
+        }
+        strncpy(tmp_crash_info.call_stack, stackBuffer, sizeof(tmp_crash_info.call_stack) - 1);
+        tmp_crash_info.call_stack[sizeof(tmp_crash_info.call_stack) - 1] = '\0';
+    }
+
+#else
+	CONTEXT ctx32 = {0};
+	ctx32.ContextFlags = CONTEXT_FULL;
+	if (!GetThreadContext(thread_handle, &ctx32)) {
+		CloseHandle(thread_handle);
+		FATAL("GetThreadContext failed, GLE=%x.\n", GetLastError());
+	}
+	
+	pos += sprintf(tmp_crash_info.registers + pos, "EIP=0x%08x ESP=0x%08x EBP=0x%08x\n", ctx32.Eip, ctx32.Esp, ctx32.Ebp);
+	pos += sprintf(tmp_crash_info.registers + pos, "EAX=0x%08x EBX=0x%08x ECX=0x%08x\n", ctx32.Eax, ctx32.Ebx, ctx32.Ecx);
+	pos += sprintf(tmp_crash_info.registers + pos, "EDX=0x%08x ESI=0x%08x EDI=0x%08x\n", ctx32.Edx, ctx32.Esi, ctx32.Edi);
+
+	STACKFRAME stackFrame = {0};
+	DWORD machineType = IMAGE_FILE_MACHINE_I386;
+	stackFrame.AddrPC.Offset   = ctx32.Eip;
+	stackFrame.AddrPC.Mode     = AddrModeFlat;
+	stackFrame.AddrFrame.Offset = ctx32.Ebp;
+	stackFrame.AddrFrame.Mode   = AddrModeFlat;
+	stackFrame.AddrStack.Offset = ctx32.Esp;
+	stackFrame.AddrStack.Mode   = AddrModeFlat;
+
+	char stackBuffer[65536] = {0};
+    int frameCount = 0;
+    while (StackWalk(machineType, process, thread_handle, &stackFrame, &ctx32, NULL, SymFunctionTableAccess, SymGetModuleBase, NULL) && frameCount < 64){
+        char temp[512] = {0};
+		DWORD64 addr = stackFrame.AddrPC.Offset;
+		SYMBOL_INFO *symbol = (SYMBOL_INFO *)malloc(sizeof(SYMBOL_INFO) + 256 * sizeof(char));
+        
+		if (symbol) {
+			symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+			symbol->MaxNameLen = 255;
+			
+			if (SymFromAddr(process, addr, 0, symbol)) {
+				IMAGEHLP_MODULE64 modInfo;
+				modInfo.SizeOfStruct = sizeof(modInfo);
+
+				if (SymGetModuleInfo(process, addr, &modInfo)) {
+					DWORD64 offset = addr - symbol->Address;
+					// format: [#] ModuleName!SymbolName+0xOffset - 0xAddress
+					snprintf(temp, sizeof(temp), "[#]%d %s!%s+0x%lx - 0x%08llx\n", frameCount, modInfo.ModuleName, symbol->Name, (unsigned long)offset, addr);
+				} else {
+					DWORD64 offset = addr - symbol->Address;
+					snprintf(temp, sizeof(temp), "[#]%d %s+0x%lx - 0x%08llx\n", frameCount, symbol->Name, (unsigned long)offset, addr);
+				}
+			} else {
+				snprintf(temp, sizeof(temp), "[#]%d 0x%08llx\n", frameCount, addr);
+			}
+
+			free(symbol);
+			strncat(stackBuffer, temp, sizeof(stackBuffer) - strlen(stackBuffer) - 1);
+			frameCount++;
+		} 
+		else {
+			FATAL("malloc failed, GLE=%x.\n", GetLastError());
+		}
+    }
+    strncpy(tmp_crash_info.call_stack, stackBuffer, sizeof(tmp_crash_info.call_stack) - 1);
+    tmp_crash_info.call_stack[sizeof(tmp_crash_info.call_stack) - 1] = '\0';
+
+#endif
+
+    CloseHandle(thread_handle);
+	SymCleanup(process);
+}
+
+
+void CaptureFullDump(LPDEBUG_EVENT DebugEv)
+{
+    char tmpfilename[MAX_PATH];
+    sprintf(tmpfilename, "%s\\%s", section_cache_dir, TEMP_DUMP_FILENAME);
+
+    HANDLE hFile = CreateFileA(tmpfilename, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+		FATAL("CreateFileA failed for dump file %s, GLE=%x.\n", tmpfilename, GetLastError());
+    }
+
+	// Prevent error code 0x8007012b
+    const DWORD dumpFlags = MiniDumpWithFullMemory | MiniDumpWithFullMemoryInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo | MiniDumpIgnoreInaccessibleMemory;
+	
+	MINIDUMP_EXCEPTION_INFORMATION mdei = {0};
+    mdei.ThreadId = DebugEv->dwThreadId;
+    mdei.ExceptionPointers = NULL;
+    mdei.ClientPointers = FALSE;
+
+    BOOL result = MiniDumpWriteDump(child_handle, GetProcessId(child_handle), hFile, (MINIDUMP_TYPE)dumpFlags, &mdei, NULL, NULL);
+
+    CloseHandle(hFile);
+
+    if (!result) {
+		FATAL("MiniDumpWriteDump failed, GLE=%x.\n", GetLastError());
+    }
+}
+
+void save_crash_dump(const char *fn)
+{
+    char tmpfilename[MAX_PATH];
+    sprintf(tmpfilename, "%s\\%s", section_cache_dir, TEMP_DUMP_FILENAME);
+
+    if (!MoveFileExA(tmpfilename, fn, MOVEFILE_REPLACE_EXISTING)) {
+		FATAL("MoveFileExA failed to move dump file to %s, GLE=%x.\n", fn, GetLastError());
+    }
+}
+
+
 // standard debugger loop that listens to relevant events in the target process
 int debug_loop()
 {
@@ -1130,6 +1455,9 @@ int debug_loop()
 					dbg_continue_status = DBG_CONTINUE;
 					return DEBUGGER_FUZZMETHOD_END;
 				} else {
+					ret_exception_code = DebugEv->u.Exception.ExceptionRecord.ExceptionCode;
+					capture_crash_debug_info(DebugEv);
+					CaptureFullDump(DebugEv);
 					dbg_continue_status = DBG_EXCEPTION_NOT_HANDLED;
 					return DEBUGGER_CRASHED;
 				}
@@ -1143,6 +1471,9 @@ int debug_loop()
 			case STATUS_HEAP_CORRUPTION:
 			case STATUS_STACK_BUFFER_OVERRUN:
 			case STATUS_FATAL_APP_EXIT:
+				ret_exception_code = DebugEv->u.Exception.ExceptionRecord.ExceptionCode;
+				capture_crash_debug_info(DebugEv);
+				CaptureFullDump(DebugEv);
 				dbg_continue_status = DBG_EXCEPTION_NOT_HANDLED;
 				return DEBUGGER_CRASHED;
 				break;
@@ -1378,6 +1709,16 @@ void resumes_process() {
 		dbg_continue_status);
 }
 
+void free_all_modules(void) {
+    module_info_t *current = all_modules;
+    while (current) {
+        module_info_t *next = current->next;
+        free(current);
+        current = next;
+    }
+    all_modules = NULL;
+}
+
 void kill_process() {
 	// end tracing
 	if (options.persistent_trace) {
@@ -1406,7 +1747,44 @@ void kill_process() {
 		free(tmp);
 	}
 	breakpoints = NULL;
+	
+	// free section cache if allocated
+    if (section_cache) {
+        pt_iscache_free(section_cache);
+        section_cache = pt_iscache_alloc("winafl_cache");
+    }
+    
+    // free the modules list
+    free_all_modules();
 }
+
+void save_crash_ptlog(const char *fn){
+	FILE *fp = fopen(fn, "wb");
+	if (!fp) {
+		FATAL("fopen failed, GLE=%x.\n", GetLastError());
+	}
+	fwrite(tmp_raw_pt_data, 1, tmp_raw_pt_data_size, fp);
+	fclose(fp);
+}
+
+void copy_raw_pt_data(PIPT_TRACE_DATA trace_data) {
+    if (!trace_data) return;
+    
+    if (tmp_raw_pt_data) {
+        HeapFree(GetProcessHeap(), 0, tmp_raw_pt_data);
+        tmp_raw_pt_data = NULL;
+        tmp_raw_pt_data_size = 0;
+    }
+    
+    tmp_raw_pt_data_size = FIELD_OFFSET(IPT_TRACE_DATA, TraceData) + trace_data->TraceSize;
+    tmp_raw_pt_data = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, tmp_raw_pt_data_size);
+    if (!tmp_raw_pt_data) {
+        FATAL("Memory allocation failed for raw PT data copy, GLE=%x.\n", GetLastError());
+    }
+    
+    memcpy(tmp_raw_pt_data, trace_data, tmp_raw_pt_data_size);
+}
+
 
 int run_target_pt(char **argv, uint32_t timeout) {
 	int debugger_status;
@@ -1472,6 +1850,9 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	if (!trace_data) {
 		printf("Error getting ipt trace\n");
 	} else {
+		if(debugger_status == DEBUGGER_CRASHED){
+			copy_raw_pt_data(trace_data);
+		}
 		trace_buffer_overflowed = collect_trace(trace_data);
 		HeapFree(GetProcessHeap(), 0, trace_data);
 	}
